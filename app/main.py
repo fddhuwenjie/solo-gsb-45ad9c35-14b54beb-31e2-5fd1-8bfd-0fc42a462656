@@ -1,4 +1,4 @@
-"""FastAPI 应用：/validate 校验、/evaluate 评估、/explanations/minimize 最小充分上下文、/guardrails/evaluate 序贯护栏、/approvals/evaluate 多人审批、/experiments/attribute 实验归因、/artifacts 制品签发验签、/release-windows/resolve 发布窗口、/rollouts/rebalance 权重重排、/flags/retirement-plan 开关下线方案与 /sdk/reconcile 决策日志核对。"""
+"""FastAPI 应用：/validate 校验、/evaluate 评估、/explanations/minimize 最小充分上下文、/guardrails/evaluate 序贯护栏、/approvals/evaluate 多人审批、/experiments/attribute 实验归因、/artifacts 制品签发验签、/release-windows/resolve 发布窗口、/rollouts/rebalance 权重重排、/flags/retirement-plan 开关下线方案、/sdk/reconcile 决策日志核对与 /sdk/rollout-plan 制品分批铺开。"""
 
 from __future__ import annotations
 
@@ -31,6 +31,8 @@ from app.models import (
     ReleaseResolveResponse,
     RetirementPlanRequest,
     RetirementPlanResponse,
+    RolloutPlanRequest,
+    RolloutPlanResponse,
     SignRequest,
     SignResponse,
     TraceEntry,
@@ -42,6 +44,7 @@ from app.rebalance import rebalance
 from app.reconcile import ReconcileRequestError, reconcile
 from app.release_windows import resolve_release_windows
 from app.retirement import RetirementRequestError, build_retirement_plan
+from app.rollout import build_rollout_plan
 from app.validation import validate_config
 
 app = FastAPI(
@@ -51,8 +54,8 @@ app = FastAPI(
         "提供配置校验、用户级变体评估、最小充分上下文解释、"
         "二项失败率序贯护栏（Wald SPRT）、"
         "配置制品签发/验签、多人审批判定、曝光-转化实验归因、"
-        "多地区发布窗口求解、变体权重重排、已关闭开关的下线方案生成"
-        "与 SDK 节点决策日志核对。"
+        "多地区发布窗口求解、变体权重重排、已关闭开关的下线方案生成、"
+        "SDK 节点决策日志核对与配置制品分批铺开规划。"
     ),
     version="1.0.0",
 )
@@ -289,3 +292,12 @@ def reconcile_sdk_logs(request: ReconcileRequest) -> ReconcileResponse:
     except ReconcileRequestError as exc:
         # 快照摘要重复、事件引用快照中不存在的开关。
         raise HTTPException(status_code=422, detail=str(exc)) from None
+
+
+@app.post("/sdk/rollout-plan", response_model=RolloutPlanResponse)
+def sdk_rollout_plan(request: RolloutPlanRequest) -> RolloutPlanResponse:
+    """配置制品分批铺开：在并发与全局/分区不可用权重上限下精确求最少波次。"""
+    # 重复节点 ID、未知分区限额、非正权重、非法上限（含失败域重复约束）
+    # 都在模型校验阶段即 422；单节点单独更新也超限时返回 blockers，
+    # 不给出部分计划。
+    return build_rollout_plan(request)

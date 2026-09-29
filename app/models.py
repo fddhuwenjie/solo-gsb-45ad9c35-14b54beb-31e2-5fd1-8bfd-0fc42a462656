@@ -1339,3 +1339,140 @@ class ReconcileResponse(BaseModel):
     event_count: int = Field(ge=0)
     results: list[ReconcileResult] = Field(default_factory=list)
     nodes: list[NodeReconcileSummary] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# SDK 配置制品分批铺开（最少波次滚动更新计划）
+# ---------------------------------------------------------------------------
+
+# 单次请求节点数上限：规划在 2^N 子集空间上精确求解，16 个节点仍可快速枚举。
+MAX_ROLLOUT_NODES = 16
+
+
+class RolloutNode(BaseModel):
+    """SDK 节点：唯一 ID、当前制品摘要、所属 region、failure_domain 与正流量权重。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str = Field(min_length=1)
+    current_digest: str = Field(min_length=1)
+    region: str = Field(min_length=1)
+    failure_domain: str = Field(min_length=1)
+    traffic_weight: int = Field(gt=0)
+
+
+class RegionUnavailableLimit(BaseModel):
+    """单个 region 每波允许的最大不可用流量权重（0 表示该分区不允许任何节点更新）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    region: str = Field(min_length=1)
+    max_unavailable_weight: int = Field(ge=0)
+
+
+class RolloutPlanRequest(BaseModel):
+    """POST /sdk/rollout-plan 请求。
+
+    - 只规划 current_digest 与 target_digest 不同的节点（已在目标摘要的跳过）；
+    - 同一波节点同时不可用：波内节点数 ≤ max_parallel、权重和 ≤ 全局上限、
+      各 region 权重和 ≤ 该 region 上限，且同一 failure_domain 每波最多一个
+      （failure_domain 全局判重，不按 region 切分）；
+    - 每个节点所在 region 都必须在 region_limits 中给出限额（未知分区 422）；
+      节点 ID 与限额 region 均不允许重复。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_digest: str = Field(min_length=1)
+    nodes: list[RolloutNode] = Field(min_length=1, max_length=MAX_ROLLOUT_NODES)
+    max_parallel: int = Field(ge=1)
+    max_unavailable_weight: int = Field(ge=0)
+    region_limits: list[RegionUnavailableLimit] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "RolloutPlanRequest":
+        node_ids: set[str] = set()
+        for node in self.nodes:
+            if node.node_id in node_ids:
+                raise ValueError(f"节点 ID 重复: '{node.node_id}'")
+            node_ids.add(node.node_id)
+
+        limit_regions: set[str] = set()
+        for entry in self.region_limits:
+            if entry.region in limit_regions:
+                raise ValueError(f"分区限额重复声明: '{entry.region}'")
+            limit_regions.add(entry.region)
+
+        for node in self.nodes:
+            if node.region not in limit_regions:
+                raise ValueError(
+                    f"节点 '{node.node_id}' 所在分区 '{node.region}' "
+                    f"未在 region_limits 中声明限额"
+                )
+        return self
+
+
+class RolloutStatus(str, enum.Enum):
+    """铺开计划总状态。"""
+
+    READY = "ready"
+    BLOCKED = "blocked"
+
+
+class RolloutBlockerReason(str, enum.Enum):
+    """节点即使单独更新也违反的上限。"""
+
+    EXCEEDS_GLOBAL_LIMIT = "exceeds_global_limit"
+    EXCEEDS_REGION_LIMIT = "exceeds_region_limit"
+
+
+class RolloutBlocker(BaseModel):
+    """阻断项：节点单独更新即超全局/分区不可用权重上限，无法进入任何波。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str
+    region: str
+    failure_domain: str
+    traffic_weight: int = Field(ge=1)
+    reasons: list[RolloutBlockerReason] = Field(min_length=1)
+
+
+class RegionUnavailableWeight(BaseModel):
+    """单波内某个 region 的不可用权重小计（仅列出本波有节点更新的分区）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    region: str
+    unavailable_weight: int = Field(ge=0)
+
+
+class RolloutWave(BaseModel):
+    """一个更新波：波内节点同时不可用；completed_nodes 为截至本波累计完成的节点。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    wave: int = Field(ge=1)
+    node_ids: list[str] = Field(min_length=1)
+    global_unavailable_weight: int = Field(ge=0)
+    region_unavailable_weights: list[RegionUnavailableWeight] = Field(
+        default_factory=list
+    )
+    completed_nodes: list[str] = Field(min_length=1)
+
+
+class RolloutPlanResponse(BaseModel):
+    """POST /sdk/rollout-plan 响应。
+
+    status=blocked：任一节点单独更新也超限时只返回 blockers，waves 为空，
+    不给出任何部分计划；status=ready：waves 为最少波次计划，多解时按
+    “每波 ID 升序后的波次序列字典序最小”择优。所有节点已在目标摘要时
+    waves 与 blockers 均为空。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_digest: str
+    status: RolloutStatus
+    waves: list[RolloutWave] = Field(default_factory=list)
+    blockers: list[RolloutBlocker] = Field(default_factory=list)

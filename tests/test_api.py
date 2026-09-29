@@ -188,3 +188,62 @@ def test_release_windows_resolve_rejects_non_utc(client):
         },
     )
     assert resp.status_code == 422
+
+
+ROLLOUT_URL = "/sdk/rollout-plan"
+
+
+def test_sdk_rollout_plan_round_trip(client):
+    """端到端：最少波次 + 累计完成节点，阻塞与 422 语义在 API 层可达。"""
+    resp = client.post(
+        ROLLOUT_URL,
+        json={
+            "target_digest": "new",
+            "nodes": [
+                {"node_id": "a", "current_digest": "old", "region": "r1",
+                 "failure_domain": "f1", "traffic_weight": 1},
+                {"node_id": "b", "current_digest": "old", "region": "r1",
+                 "failure_domain": "f2", "traffic_weight": 1},
+                {"node_id": "c", "current_digest": "new", "region": "r1",
+                 "failure_domain": "f3", "traffic_weight": 1},
+            ],
+            "max_parallel": 1,
+            "max_unavailable_weight": 10,
+            "region_limits": [{"region": "r1", "max_unavailable_weight": 10}],
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "ready"
+    assert [w["node_ids"] for w in data["waves"]] == [["a"], ["b"]]
+    assert data["waves"][-1]["completed_nodes"] == ["a", "b"]
+
+
+def test_sdk_rollout_plan_blocker_and_422(client):
+    blocked = client.post(
+        ROLLOUT_URL,
+        json={
+            "target_digest": "new",
+            "nodes": [{"node_id": "a", "current_digest": "old", "region": "r1",
+                       "failure_domain": "f1", "traffic_weight": 99}],
+            "max_parallel": 1,
+            "max_unavailable_weight": 10,
+            "region_limits": [{"region": "r1", "max_unavailable_weight": 10}],
+        },
+    )
+    assert blocked.status_code == 200
+    assert blocked.json()["status"] == "blocked"
+    assert blocked.json()["waves"] == []
+
+    bad = client.post(
+        ROLLOUT_URL,
+        json={
+            "target_digest": "new",
+            "nodes": [{"node_id": "a", "current_digest": "old", "region": "mystery",
+                       "failure_domain": "f1", "traffic_weight": 1}],
+            "max_parallel": 1,
+            "max_unavailable_weight": 10,
+            "region_limits": [{"region": "r1", "max_unavailable_weight": 10}],
+        },
+    )
+    assert bad.status_code == 422
