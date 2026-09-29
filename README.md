@@ -39,7 +39,13 @@
   重算制品规范化 SHA-256 摘要，按激活时刻与宽限得到各摘要的允许区间，
   把事件时间扩为 ±时钟偏差区间后分类（`consistent / ambiguous_time /
   early_version / stale_version / unknown_digest`），并对可识别摘要
-  复用评估器重算 `variant_id / served_default / reason` 比对节点上报值。
+  复用评估器重算 `variant_id / served_default / reason` 比对节点上报值；
+- **制品分波铺开**：把一份配置制品（`target_digest`）安全铺开到 1～16 个
+  SDK 节点——只规划当前摘要不同的节点，同一波节点同时不可用，受
+  `max_parallel`、全局与各 region 每波最大不可用流量权重及故障域
+  （同一 `failure_domain` 每波至多一个节点）约束，用节点子集精确枚举
+  求出**最少波次**，多解时每波 ID 升序后取波次序列**字典序最小**者；
+  任一节点单独更新仍超全局或其分区权重上限时返回 `blockers`，不出部分计划。
 
 响应包含**最终变体、命中轨迹（trace）与失败原因（reason）**。
 
@@ -1090,6 +1096,129 @@ curl -s http://localhost:8000/sdk/reconcile \
   -d "$(jq -c '{snapshots: [{config: ., activated_at: "2026-03-01T00:00:00Z"}], grace_seconds: 300, clock_skew_seconds: 60, events: []}' examples/config.json)"
 ```
 
+### `POST /sdk/rollout-plan` — 配置制品分波铺开规划
+
+把一份配置制品（以 `target_digest` 标识）安全铺开到若干 SDK 节点：规划
+**分波更新顺序**，同一波内的节点同时更新、同时不可用，服务用节点子集
+精确枚举求出**最少波次**，并在多解中取确定性的字典序最优方案。
+
+请求体：
+
+```json
+{
+  "target_digest": "sha256-of-new-artifact",
+  "nodes": [
+    {"id": "node-a", "current_digest": "sha256-old", "region": "cn-east", "failure_domain": "az-1", "traffic_weight": 30},
+    {"id": "node-b", "current_digest": "sha256-old", "region": "cn-east", "failure_domain": "az-2", "traffic_weight": 30},
+    {"id": "node-c", "current_digest": "sha256-of-new-artifact", "region": "cn-north", "failure_domain": "az-1", "traffic_weight": 40}
+  ],
+  "max_parallel": 2,
+  "max_unavailable_weight": 50,
+  "region_max_unavailable_weight": {"cn-east": 40, "cn-north": 60}
+}
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `target_digest` | 目标制品摘要（非空字符串） |
+| `nodes` | 1～**16** 个节点：`id`（唯一）、`current_digest`、`region`、`failure_domain`、`traffic_weight`（**正整数**流量权重） |
+| `max_parallel` | 每波最多同时更新的节点数（**正整数**） |
+| `max_unavailable_weight` | 每波允许的**全局**最大不可用流量权重（**正整数**） |
+| `region_max_unavailable_weight` | 各 region 每波允许的最大不可用流量权重（映射非空，值为**正整数**）；节点的 region 必须在此声明 |
+
+规划语义：
+
+1. **只规划摘要不同的节点**：`current_digest == target_digest` 的节点无需
+   更新，进入 `up_to_date_nodes`（仍计入各波的累计完成节点），不占任何波；
+2. 同一波节点**同时不可用**，一波必须同时满足：
+   - 节点数不超过 `max_parallel`；
+   - 波内全部节点流量权重之和不超过全局 `max_unavailable_weight`（含端点）；
+   - 波内每个 region 的权重和不超过该 region 的限额；
+   - 同一 `failure_domain` **至多一个节点**（避免整个故障域同时失联）；
+3. **最少波次为精确解**：枚举每个节点子集能否单独成波（剪枝 DFS），
+   子集 DP 求覆盖全部待更新节点的最少波数；
+4. **平局规则**：同为最少波次的多个方案中，把每波节点 ID 升序后，取波次
+   序列（元组序列）**字典序最小**者——注意元组按位置比较，与子集的整数
+   大小无关；结果与节点的提交顺序无关；
+5. **不可行判定（blockers）**：任一节点**单独更新**（独占一波）时其权重
+   仍超过全局或其 region 上限，则无法铺开：该节点分别给出
+   `global_weight_exceeded` / `region_weight_exceeded` blocker（两者可同时
+   命中），响应 `status=blocked` 且**不给出任何部分计划**（`waves` 为空）。
+   并发数与故障域约束总能通过逐节点成波满足，不产生 blocker；
+6. 节点上限 16：`2^16` 个候选子集保证精确枚举在常数时间内完成。
+
+响应（`200`，`status=planned`）：
+
+```json
+{
+  "target_digest": "sha256-of-new-artifact",
+  "status": "planned",
+  "up_to_date_nodes": ["node-c"],
+  "planned_node_count": 2,
+  "waves": [
+    {
+      "wave": 1,
+      "node_ids": ["node-a"],
+      "global_unavailable_weight": 30,
+      "region_unavailable_weight": {"cn-east": 30},
+      "completed_node_ids": ["node-a", "node-c"],
+      "completed_node_count": 2
+    },
+    {
+      "wave": 2,
+      "node_ids": ["node-b"],
+      "global_unavailable_weight": 30,
+      "region_unavailable_weight": {"cn-east": 30},
+      "completed_node_ids": ["node-a", "node-b", "node-c"],
+      "completed_node_count": 3
+    }
+  ],
+  "blockers": []
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `up_to_date_nodes` | 请求时摘要已等于目标、无需更新的节点（ID 升序） |
+| `planned_node_count` | 实际参与分波规划的节点数（摘要不同者） |
+| `waves[].wave` | 从 1 起的波次序号 |
+| `waves[].node_ids` | 本波同时更新的节点（ID 升序） |
+| `waves[].global_unavailable_weight` | 本波全部节点流量权重之和（即本波全局不可用权重） |
+| `waves[].region_unavailable_weight` | 本波**实际涉及** region 的不可用权重和（按 region 名升序） |
+| `waves[].completed_node_ids` / `completed_node_count` | 含本波及之前各波累计完成的全部节点（含 `up_to_date_nodes`） |
+
+`status=blocked` 时 `blockers` 的条目：
+
+| 字段 | 说明 |
+| --- | --- |
+| `kind` | `global_weight_exceeded`（单节点权重超全局上限）/ `region_weight_exceeded`（超其 region 上限） |
+| `node_id` / `region` / `traffic_weight` | 阻断节点与其当前流量权重 |
+| `limit` | 被突破的上限值 |
+
+`blockers` 按 `(node_id, kind)` 升序（同节点先全局后分区）；此时
+`up_to_date_nodes` 与 `planned_node_count` 仍照常给出，便于排查。
+
+请求校验（不满足时返回 `422`）：
+
+| 规则 | 说明 |
+| --- | --- |
+| 节点数 | 1～16 个（恰好 16 合法，17 拒绝） |
+| 重复 ID | 节点 `id` 不允许重复 |
+| 未知分区限额 | 节点的 `region` 必须在 `region_max_unavailable_weight` 中声明（声明了但未被节点使用的限额允许保留） |
+| 权重 | `traffic_weight` 必须为正整数；`max_parallel`、全局与各 region 上限必须为正整数 |
+| 必填非空 | `target_digest`、节点 `id` / `current_digest` / `region` / `failure_domain` 不允许空串 |
+| 额外字段 | 请求与节点对象均拒绝未声明字段 |
+
+请求示例：
+
+```bash
+curl -s http://localhost:8000/sdk/rollout-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"target_digest":"new","max_parallel":2,"max_unavailable_weight":50,"region_max_unavailable_weight":{"r1":50},"nodes":[{"id":"a","current_digest":"old","region":"r1","failure_domain":"fd-a","traffic_weight":20},{"id":"b","current_digest":"old","region":"r1","failure_domain":"fd-b","traffic_weight":20}]}'
+```
+
 ### `GET /health`
 
 ```json
@@ -1161,6 +1290,16 @@ pytest
   event_id 内容冲突 422、结果按 (节点, 时间, 事件 ID) 排序与节点计数、
   快照 activated_at 重复/摘要重复/空快照/负时长/事件引用快照未知开关/
   坏快照配置/空 ID/额外字段 422；
+- 制品分波铺开：全部已达目标时空规划（up_to_date 全量列出）、已达目标节点
+  预置累计完成列表、单波铺满与 max_parallel 拆波（=1 逐节点）、全局权重
+  上限迫使精确 2 波（朴素贪心填满会错成 3 波）、分区权重独立拆波、同故障
+  域每波至多一个（仅故障域冲突不产生 blocker）、平局优先单节点首波、不同
+  基数的首波元组按位置而非子集掩码比较、提交顺序不影响结果、每波 ID 升序
+  且波次间字典序有序、单节点超全局/分区上限（可同时命中两条）、任一
+  blocker 即不出部分计划、blocker 稳定排序、权重恰好等于上限合法、综合
+  约束交互与逐波分区权重、16 节点上限精确求解；非正并发/全局/分区上限、
+  非正权重、重复节点 ID、未知分区限额、空限额映射、空节点列表、17 节点、
+  空串字段、额外/缺失字段 422，16 节点边界与未使用限额 200；
 - API：健康检查、404、坏配置/环/未知依赖返回 422、同用户结果稳定、不同盐值产生分流、
   发布窗口求解往返与非 UTC 拒绝。
 
@@ -1168,7 +1307,7 @@ pytest
 
 ```
 app/
-  models.py          # Pydantic 模型（开关/变体/依赖/规则/制品/护栏/审批/归因/发布窗口/最小上下文/权重重排/下线方案/日志核对/请求响应）
+  models.py          # Pydantic 模型（开关/变体/依赖/规则/制品/护栏/审批/归因/发布窗口/最小上下文/权重重排/下线方案/分波铺开/日志核对/请求响应）
   validation.py      # 依赖图、引用、权重、环检测（迭代 DFS 三色标记，显式栈）
   evaluator.py       # 迭代依赖评估（显式帧栈 + 轨迹段树）、条件求值、SHA-256 分桶、权重选变体
   explanations.py    # 最小充分上下文：依赖闭包属性收集（迭代）、保留集合（属性数/字典序）枚举、域值与缺失态重评
@@ -1179,8 +1318,9 @@ app/
   release_windows.py # 发布窗口：周期窗口逐日展开（跨午夜/DST gap 顺延/fold 早晚）、合并、扣黑窗、交集裁剪
   rebalance.py       # 权重重排：枚举目标顺序求全稳定桶最大布局（字典序破平局）、迁移矩阵与同向相邻区间合并
   retirement.py      # 开关下线方案：blocker 收集、终态依赖改写、候选分层删除（依赖方先于被依赖方）
+  rollout.py         # 制品分波铺开：子集可行性剪枝枚举、最少波次 DP（下界短路）、字典序最小重建
   reconcile.py       # 决策日志核对：快照摘要允许区间、±偏差时间分类、评估器重算比对、节点计数
-  main.py            # FastAPI 路由 /validate /evaluate /explanations/minimize /guardrails/evaluate /approvals/evaluate /experiments/attribute /artifacts/sign /artifacts/verify /release-windows/resolve /rollouts/rebalance /flags/retirement-plan /sdk/reconcile /health
+  main.py            # FastAPI 路由 /validate /evaluate /explanations/minimize /guardrails/evaluate /approvals/evaluate /experiments/attribute /artifacts/sign /artifacts/verify /release-windows/resolve /rollouts/rebalance /flags/retirement-plan /sdk/rollout-plan /sdk/reconcile /health
 tests/               # pytest 套件
 examples/config.json
 Dockerfile

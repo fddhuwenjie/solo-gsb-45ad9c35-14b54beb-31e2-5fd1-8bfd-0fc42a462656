@@ -1339,3 +1339,136 @@ class ReconcileResponse(BaseModel):
     event_count: int = Field(ge=0)
     results: list[ReconcileResult] = Field(default_factory=list)
     nodes: list[NodeReconcileSummary] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# SDK 配置制品分波铺开规划（并发/故障域/全局与分区不可用权重约束）
+# ---------------------------------------------------------------------------
+
+# 单次规划的节点数上限：规划问题按节点子集做精确枚举，2^16 仍可接受。
+MAX_ROLLOUT_NODES = 16
+
+
+class RolloutNode(BaseModel):
+    """待铺开节点：当前摘要不同于 target_digest 才需要更新。
+
+    traffic_weight 为正整数流量权重；同一 failure_domain 的节点同时不可用
+    会让该故障域完全失联，因此每波至多从同一 failure_domain 选一个节点。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    current_digest: str = Field(min_length=1)
+    region: str = Field(min_length=1)
+    failure_domain: str = Field(min_length=1)
+    traffic_weight: int = Field(gt=0)
+
+
+class RolloutPlanRequest(BaseModel):
+    """POST /sdk/rollout-plan 请求。
+
+    region_max_unavailable_weight 给出各 region 每波允许的最大不可用流量
+    权重；节点的 region 必须在其中声明（未知分区限额拒绝，422），
+    未被任何节点使用的限额声明允许保留。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_digest: str = Field(min_length=1)
+    nodes: list[RolloutNode] = Field(min_length=1, max_length=MAX_ROLLOUT_NODES)
+    max_parallel: int = Field(gt=0)
+    max_unavailable_weight: int = Field(gt=0)
+    region_max_unavailable_weight: dict[str, int] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "RolloutPlanRequest":
+        # 节点 ID 全局唯一。
+        seen: set[str] = set()
+        for node in self.nodes:
+            if node.id in seen:
+                raise ValueError(f"节点 ID 重复: '{node.id}'")
+            seen.add(node.id)
+
+        # 分区限额键不允许空串，值必须为正整数。
+        for region, limit in self.region_max_unavailable_weight.items():
+            if not region:
+                raise ValueError("分区名不允许为空串")
+            if limit <= 0:
+                raise ValueError(f"分区 '{region}' 的每波最大不可用权重必须为正整数")
+
+        # 节点所在分区必须声明限额（未知分区限额 → 422）。
+        for node in self.nodes:
+            if node.region not in self.region_max_unavailable_weight:
+                raise ValueError(
+                    f"节点 '{node.id}' 的分区缺少限额声明: '{node.region}'"
+                )
+        return self
+
+
+class RolloutBlockerKind(str, enum.Enum):
+    """分波铺开的阻断原因类型。"""
+
+    GLOBAL_WEIGHT_EXCEEDED = "global_weight_exceeded"
+    REGION_WEIGHT_EXCEEDED = "region_weight_exceeded"
+
+
+class RolloutBlocker(BaseModel):
+    """一个阻断项：该节点单独更新（单独占一波）即超限。
+
+    kind=global_weight_exceeded：节点流量权重大于全局每波最大不可用权重；
+    kind=region_weight_exceeded：节点流量权重大于其分区每波最大不可用权重。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: RolloutBlockerKind
+    node_id: str
+    region: str
+    traffic_weight: int = Field(gt=0)
+    limit: int = Field(gt=0)
+
+
+class RolloutWave(BaseModel):
+    """一个铺开波：波内节点同时更新（同时不可用）。
+
+    node_ids 按 ID 升序；global_unavailable_weight 为本波全部节点流量权重
+    之和，region_unavailable_weight 为本波实际涉及分区的权重和（按分区名
+    升序）；completed_node_ids 为含本波在内累计已完成的全部节点
+    （含请求时摘要已等于 target_digest 的节点），completed_node_count 为
+    其数量。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    wave: int = Field(ge=1)
+    node_ids: list[str] = Field(min_length=1)
+    global_unavailable_weight: int = Field(ge=1)
+    region_unavailable_weight: dict[str, int] = Field(default_factory=dict)
+    completed_node_ids: list[str] = Field(default_factory=list)
+    completed_node_count: int = Field(ge=1)
+
+
+class RolloutStatus(str, enum.Enum):
+    """铺开规划总状态。"""
+
+    PLANNED = "planned"
+    BLOCKED = "blocked"
+
+
+class RolloutPlanResponse(BaseModel):
+    """POST /sdk/rollout-plan 响应。
+
+    status=planned：waves 为波次最少的精确规划，并列时把每波 ID 升序后
+    取波次序列字典序最小者；status=blocked：只返回 blockers 与
+    up_to_date_nodes，不给出任何部分计划（waves 为空）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_digest: str
+    status: RolloutStatus
+    up_to_date_nodes: list[str] = Field(default_factory=list)
+    planned_node_count: int = Field(ge=0)
+    waves: list[RolloutWave] = Field(default_factory=list)
+    blockers: list[RolloutBlocker] = Field(default_factory=list)

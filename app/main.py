@@ -1,4 +1,4 @@
-"""FastAPI 应用：/validate 校验、/evaluate 评估、/explanations/minimize 最小充分上下文、/guardrails/evaluate 序贯护栏、/approvals/evaluate 多人审批、/experiments/attribute 实验归因、/artifacts 制品签发验签、/release-windows/resolve 发布窗口、/rollouts/rebalance 权重重排、/flags/retirement-plan 开关下线方案与 /sdk/reconcile 决策日志核对。"""
+"""FastAPI 应用：/validate 校验、/evaluate 评估、/explanations/minimize 最小充分上下文、/guardrails/evaluate 序贯护栏、/approvals/evaluate 多人审批、/experiments/attribute 实验归因、/artifacts 制品签发验签、/release-windows/resolve 发布窗口、/rollouts/rebalance 权重重排、/flags/retirement-plan 开关下线方案、/sdk/rollout-plan 制品分波铺开与 /sdk/reconcile 决策日志核对。"""
 
 from __future__ import annotations
 
@@ -31,6 +31,8 @@ from app.models import (
     ReleaseResolveResponse,
     RetirementPlanRequest,
     RetirementPlanResponse,
+    RolloutPlanRequest,
+    RolloutPlanResponse,
     SignRequest,
     SignResponse,
     TraceEntry,
@@ -42,6 +44,7 @@ from app.rebalance import rebalance
 from app.reconcile import ReconcileRequestError, reconcile
 from app.release_windows import resolve_release_windows
 from app.retirement import RetirementRequestError, build_retirement_plan
+from app.rollout import build_rollout_plan
 from app.validation import validate_config
 
 app = FastAPI(
@@ -289,3 +292,15 @@ def reconcile_sdk_logs(request: ReconcileRequest) -> ReconcileResponse:
     except ReconcileRequestError as exc:
         # 快照摘要重复、事件引用快照中不存在的开关。
         raise HTTPException(status_code=422, detail=str(exc)) from None
+
+
+@app.post("/sdk/rollout-plan", response_model=RolloutPlanResponse)
+def sdk_rollout_plan(request: RolloutPlanRequest) -> RolloutPlanResponse:
+    """制品分波铺开：只规划摘要不同的节点，子集精确枚举求最少波次。
+
+    同波节点同时不可用，受 max_parallel、全局/分区不可用权重与故障域
+    （同域每波至多一个）约束；并列时每波 ID 升序后取波次序列字典序最小。
+    任一节点单独更新仍超全局或其分区权重上限时只返回 blockers。
+    """
+    # 重复节点 ID、未知分区限额、非正权重、非法上限等在模型校验阶段即 422。
+    return build_rollout_plan(request)
